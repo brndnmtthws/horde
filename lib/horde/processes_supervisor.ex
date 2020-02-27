@@ -182,6 +182,7 @@ defmodule Horde.ProcessesSupervisor do
   @moduledoc false
 
   @behaviour GenServer
+  require Logger
 
   @doc """
   Callback invoked to start the supervisor and during hot code upgrades.
@@ -194,8 +195,8 @@ defmodule Horde.ProcessesSupervisor do
   @typedoc "The supervisor flags returned on init"
   @type sup_flags() :: %{
           strategy: strategy(),
-          intensity: non_neg_integer(),
-          period: pos_integer(),
+          max_restarts: non_neg_integer(),
+          max_seconds: pos_integer(),
           max_children: non_neg_integer() | :infinity,
           extra_arguments: [term()]
         }
@@ -257,7 +258,11 @@ defmodule Horde.ProcessesSupervisor do
     %{
       id: id,
       start: {Horde.ProcessesSupervisor, :start_link, [opts]},
-      type: :supervisor
+      type: :supervisor,
+      # We use :permanent here because the process supervisor should *always*
+      # be running if the parent supervisor is running. If it restarts for any
+      # reason, that's an error, and it should be restarted.
+      restart: :permanent
     }
   end
 
@@ -277,7 +282,9 @@ defmodule Horde.ProcessesSupervisor do
         default = %{
           id: __MODULE__,
           start: {__MODULE__, :start_link, [arg]},
-          type: :supervisor
+          type: :supervisor,
+          # See note above about using :permanent.
+          restart: :permanent
         }
 
         Supervisor.child_spec(default, unquote(Macro.escape(opts)))
@@ -292,7 +299,13 @@ defmodule Horde.ProcessesSupervisor do
   end
 
   def terminate_child_by_id(supervisor, child_id) do
-    call(supervisor, {:terminate_child_by_id, child_id})
+    try do
+      call(supervisor, {:terminate_child_by_id, child_id})
+    catch
+      # If we try to terminate a process and that process doesn't exist, treat
+      # it as a soft failure.
+      :exit, {:noproc, _} -> :ignore
+    end
   end
 
   @doc """
@@ -389,8 +402,12 @@ defmodule Horde.ProcessesSupervisor do
 
   defp validate_and_start_child(supervisor, child_spec) do
     case validate_child(child_spec) do
-      {:ok, child} -> call(supervisor, {:start_child, child})
-      error -> {:error, error}
+      {:ok, child} ->
+        call(supervisor, {:start_child, child})
+
+      error ->
+        Logger.error("Error starting child: #{inspect(error)}")
+        {:error, error}
     end
   end
 
@@ -572,16 +589,16 @@ defmodule Horde.ProcessesSupervisor do
       raise ArgumentError, "expected :strategy option to be given"
     end
 
-    intensity = Keyword.get(options, :max_restarts, 3)
-    period = Keyword.get(options, :max_seconds, 5)
+    max_restarts = Keyword.get(options, :max_restarts, 3)
+    max_seconds = Keyword.get(options, :max_seconds, 5)
     max_children = Keyword.get(options, :max_children, :infinity)
     extra_arguments = Keyword.get(options, :extra_arguments, [])
     root_name = Keyword.fetch!(options, :root_name)
 
     flags = %{
       strategy: strategy,
-      intensity: intensity,
-      period: period,
+      max_restarts: max_restarts,
+      max_seconds: max_seconds,
       max_children: max_children,
       extra_arguments: extra_arguments,
       root_name: root_name
@@ -594,6 +611,8 @@ defmodule Horde.ProcessesSupervisor do
 
   @impl true
   def init({mod, init_arg, name}) do
+    Logger.info(fn -> "Starting #{inspect(__MODULE__)} with name #{inspect(name)}" end)
+
     Process.put(:"$initial_call", {:supervisor, mod, 1})
     Process.flag(:trap_exit, true)
 
@@ -624,8 +643,8 @@ defmodule Horde.ProcessesSupervisor do
   defp init(state, flags) do
     extra_arguments = Map.get(flags, :extra_arguments, [])
     max_children = Map.get(flags, :max_children, :infinity)
-    max_restarts = Map.get(flags, :intensity, 1)
-    max_seconds = Map.get(flags, :period, 5)
+    max_restarts = Map.get(flags, :max_restarts, 3)
+    max_seconds = Map.get(flags, :max_seconds, 5)
     strategy = Map.get(flags, :strategy, :one_for_one)
     root_name = Map.fetch!(flags, :root_name)
 
@@ -796,29 +815,48 @@ defmodule Horde.ProcessesSupervisor do
 
   @impl true
   def handle_info({:EXIT, pid, reason}, state) do
-    case maybe_restart_child(pid, reason, state) do
-      {:ok, state} -> {:noreply, state}
-      {:shutdown, state} -> {:stop, :shutdown, state}
-    end
+    Logger.info("in handle_info :EXIT reason: #{inspect(reason)}")
+
+    result =
+      case maybe_restart_child(pid, reason, state) do
+        {:ok, state} ->
+          # child restarted
+          {:noreply, state}
+
+        {:shutdown, state} ->
+          # not going to restart child, ignore
+          {:stop, :shutdown, state}
+      end
+
+    Logger.info(fn -> "in handle_info :EXIT result: #{inspect(result)}" end)
+
+    result
   end
 
   def handle_info({:"$gen_restart", pid}, state) do
+    Logger.info("handle_info :$gen_restart")
+
     %{children: children} = state
 
-    case children do
-      %{^pid => restarting_args} ->
-        {:restarting, child} = restarting_args
+    result =
+      case children do
+        %{^pid => restarting_args} ->
+          {:restarting, child} = restarting_args
 
-        case restart_child(pid, child, state) do
-          {:ok, state} -> {:noreply, state}
-          {:shutdown, state} -> {:stop, :shutdown, state}
-        end
+          case restart_child(pid, child, state) do
+            {:ok, state} -> {:noreply, state}
+            {:shutdown, state} -> {:stop, :shutdown, state}
+          end
 
-      # We may hit clause if we send $gen_restart and then
-      # someone calls terminate_child, removing the child.
-      %{} ->
-        {:noreply, state}
-    end
+        # We may hit clause if we send $gen_restart and then
+        # someone calls terminate_child, removing the child.
+        %{} ->
+          {:noreply, state}
+      end
+
+    Logger.info(fn -> ":$gen_restart result: #{inspect(result)}" end)
+
+    result
   end
 
   def handle_info(msg, state) do
@@ -844,8 +882,14 @@ defmodule Horde.ProcessesSupervisor do
   end
 
   @impl true
-  def terminate(_, %{children: children} = state) do
-    :ok = terminate_children(children, %{state | shutting_down: true})
+  def terminate(reason, %{children: children} = state) do
+    Logger.info(fn ->
+      "Terminating #{inspect(__MODULE__)} with name #{inspect(state.root_name)} reason: #{
+        inspect(reason)
+      }"
+    end)
+
+    terminate_children(children, %{state | shutting_down: true})
   end
 
   defp terminate_children(children, state) do
@@ -1017,12 +1061,16 @@ defmodule Horde.ProcessesSupervisor do
 
   defp relinquish_child_to_horde(state, pid) do
     {child_id, _, _, _, _, _} = Map.get(state.children, pid)
-    GenServer.cast(state.root_name, {:relinquish_child_process, child_id})
+    result = GenServer.cast(state.root_name, {:relinquish_child_process, child_id})
+    Logger.info(fn -> "relinquish_child_to_horde result: #{inspect(result)}" end)
+    result
   end
 
   defp remove_child_from_horde(state, pid) do
     {child_id, _, _, _, _, _} = Map.get(state.children, pid)
-    GenServer.cast(state.root_name, {:disown_child_process, child_id})
+    result = GenServer.cast(state.root_name, {:disown_child_process, child_id})
+    Logger.info(fn -> "remove_child_from_horde result: #{inspect(result)}" end)
+    result
   end
 
   defp delete_child(pid, %{children: children} = state) do
@@ -1040,33 +1088,46 @@ defmodule Horde.ProcessesSupervisor do
   end
 
   defp restart_child(pid, child, state) do
-    case add_restart(state) do
-      {:ok, %{strategy: strategy} = state} ->
-        case restart_child(strategy, pid, child, state) do
-          {:ok, state} ->
-            update_child_pid_horde(child, state)
-            {:ok, state}
+    result =
+      case add_restart(state) do
+        {:ok, %{strategy: strategy} = state} ->
+          case restart_child(strategy, pid, child, state) do
+            {:ok, state} ->
+              update_child_pid_horde(child, state)
+              {:ok, state}
 
-          {:try_again, state} ->
-            send(self(), {:"$gen_restart", pid})
-            {:ok, state}
-        end
+            {:try_again, state} ->
+              send(self(), {:"$gen_restart", pid})
+              {:ok, state}
+          end
 
-      {:shutdown, state} ->
-        report_error(:shutdown, :reached_max_restart_intensity, pid, child, state)
-        {:shutdown, delete_child(pid, state)}
-    end
+        {:shutdown, state} ->
+          report_error(:shutdown, :reached_max_restart_intensity, pid, child, state)
+          state = delete_child(pid, state)
+          update_child_pid_horde(child, state)
+          {:shutdown, state}
+      end
+
+    Logger.info(fn -> "restart_child result: #{inspect(result)}" end)
+
+    result
   end
 
   defp update_child_pid_horde({child_id, _, _, _, _, _}, state) do
     %{child_id_to_pid: child_id_to_pid} = state
 
-    case child_id_to_pid do
-      %{^child_id => new_pid} ->
-        GenServer.call(state.root_name, {:update_child_pid, child_id, new_pid})
+    try do
+      case child_id_to_pid do
+        %{^child_id => new_pid} ->
+          GenServer.call(state.root_name, {:update_child_pid, child_id, new_pid})
 
-      _pid_deleted ->
-        GenServer.cast(state.root_name, {:disown_child_process, child_id})
+        _pid_deleted ->
+          Logger.info(fn -> "PID deleted, relinquishing child" end)
+          GenServer.cast(state.root_name, {:relinquish_child_process, child_id})
+      end
+    catch
+      # if the call times out, ignore it
+      :exit, {:timeout, _} -> nil
     end
   end
 
@@ -1080,6 +1141,7 @@ defmodule Horde.ProcessesSupervisor do
     if length(restarts) <= max_restarts do
       {:ok, state}
     else
+      Logger.error("Exceeded max_restarts within max_seconds, returning :shutdown")
       {:shutdown, state}
     end
   end

@@ -20,7 +20,15 @@ defmodule Horde.Cluster do
   @spec set_members(horde :: GenServer.server(), members :: [member()], timeout :: timeout()) ::
           :ok | {:error, term()}
   def set_members(horde, members, timeout \\ 5000) do
-    GenServer.call(horde, {:set_members, members}, timeout)
+    try do
+      GenServer.call(horde, {:set_members, members}, timeout)
+    catch
+      :exit, {:timeout, _} ->
+        # Call timed out, ignore. Calling :set_members during shutdown can
+        # result in errors, so we handle that case gracefully here instead of
+        # blowing up.
+        :ok
+    end
   end
 
   @doc """

@@ -107,6 +107,16 @@ defmodule Horde.RegistryImpl do
     {:ok, state}
   end
 
+  def terminate(reason, state) do
+    Logger.info(fn ->
+      "Terminating #{inspect(__MODULE__)} with name #{inspect(state.name)} reason: #{
+        inspect(reason)
+      }"
+    end)
+
+    :ok
+  end
+
   def handle_info({:crdt_update, diffs}, state) do
     new_state = process_diffs(state, diffs)
     {:noreply, new_state}

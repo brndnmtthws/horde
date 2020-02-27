@@ -29,6 +29,20 @@ defmodule Horde.DynamicSupervisorImpl do
     GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
   end
 
+  def child_spec(options) when is_list(options) do
+    id = Keyword.get(options, :name, Horde.DynamicSupervisor)
+
+    %{
+      id: id,
+      start: {Horde.DynamicSupervisorImpl, :start_link, [options]},
+      type: :supervisor,
+      # We use :transient here because this process should not restart in the
+      # case of a normal shutdown. It should only restart when there's an
+      # exceptional error. Restarting after shutdown may cause race conditions.
+      restart: :transient
+    }
+  end
+
   ## GenServer callbacks
   defp crdt_name(name), do: :"#{name}.Crdt"
   defp supervisor_name(name), do: :"#{name}.ProcessesSupervisor"
@@ -40,7 +54,9 @@ defmodule Horde.DynamicSupervisorImpl do
   def init(options) do
     name = Keyword.get(options, :name)
 
-    Logger.info("Starting #{inspect(__MODULE__)} with name #{inspect(name)}")
+    Logger.info(fn ->
+      "Starting #{inspect(__MODULE__)} with name #{inspect(name)}"
+    end)
 
     Process.flag(:trap_exit, true)
 
@@ -51,9 +67,19 @@ defmodule Horde.DynamicSupervisorImpl do
       }
       |> Map.merge(Map.new(Keyword.take(options, [:distribution_strategy])))
 
-    state = set_own_node_status(state)
+    state = set_own_node_status(state, true)
 
     {:ok, state, {:continue, {:set_members, Keyword.get(options, :members)}}}
+  end
+
+  def terminate(reason, state) do
+    Logger.info(fn ->
+      "Terminating #{inspect(__MODULE__)} with name #{inspect(state.name)} reason: #{
+        inspect(reason)
+      }"
+    end)
+
+    :ok
   end
 
   def handle_continue({:set_members, nil}, state), do: {:noreply, state}
@@ -95,6 +121,8 @@ defmodule Horde.DynamicSupervisorImpl do
   def handle_call(:horde_shutting_down, _f, state) do
     state = %{state | shutting_down: true}
 
+    Logger.info(fn -> "Signalling shutdown of #{inspect(__MODULE__)}" end)
+
     DeltaCrdt.mutate(
       crdt_name(state.name),
       :add,
@@ -115,7 +143,7 @@ defmodule Horde.DynamicSupervisorImpl do
   end
 
   def handle_call(:wait_for_quorum, from, state) do
-    if state.distribution_strategy.has_quorum?(Map.values(members(state))) do
+    if has_quorum(state) do
       {:reply, :ok, state}
     else
       {:noreply, %{state | waiting_for_quorum: [from | state.waiting_for_quorum]}}
@@ -154,7 +182,15 @@ defmodule Horde.DynamicSupervisorImpl do
   def handle_call({:start_child, child_spec} = msg, from, state) do
     this_name = fully_qualified_name(state.name)
 
-    child_spec = randomize_child_id(child_spec)
+    # Generate a random child ID, which is used as a unique identifier for this
+    # process throughout its lifetime. We only generate a process ID once, when
+    # the child is first added to the supervisor.
+    child_spec =
+      unless Map.has_key?(child_spec, :id) do
+        randomize_child_id(child_spec)
+      else
+        child_spec
+      end
 
     case choose_node(child_spec, state) do
       {:ok, %{name: ^this_name}} ->
@@ -249,31 +285,43 @@ defmodule Horde.DynamicSupervisorImpl do
   def handle_cast({:relinquish_child_process, child_id}, state) do
     # signal to the rest of the nodes that this process has been relinquished
     # (to the Horde!) by its parent
-    {_, child, _} = Map.get(state.processes_by_id, child_id)
+    case Map.get(state.processes_by_id, child_id) do
+      {_, child, _} ->
+        :ok =
+          DeltaCrdt.mutate(
+            crdt_name(state.name),
+            :add,
+            [{:process, child.id}, {nil, child}]
+          )
 
-    :ok =
-      DeltaCrdt.mutate(
-        crdt_name(state.name),
-        :add,
-        [{:process, child.id}, {nil, child}]
-      )
+      nil ->
+        # the process doesn't exist in the local state. state not in sync?
+        Logger.info(fn -> "Child #{child_id} not present in local processes_by_id" end)
+        nil
+    end
 
     {:noreply, state}
   end
 
   # TODO think of a better name than "disown_child_process"
   def handle_cast({:disown_child_process, child_id}, state) do
-    {{_, _, child_pid}, new_processes_by_id} = Map.pop(state.processes_by_id, child_id)
+    Logger.info(fn -> ":disown_child_process, child_id=#{inspect(child_id)}" end)
 
-    new_state = %{
-      state
-      | processes_by_id: new_processes_by_id,
-        process_pid_to_id: Map.delete(state.process_pid_to_id, child_pid),
-        local_process_count: state.local_process_count - 1
-    }
+    case Map.pop(state.processes_by_id, child_id) do
+      {{_, _, child_pid}, new_processes_by_id} ->
+        new_state = %{
+          state
+          | processes_by_id: new_processes_by_id,
+            process_pid_to_id: Map.delete(state.process_pid_to_id, child_pid),
+            local_process_count: state.local_process_count - 1
+        }
 
-    :ok = DeltaCrdt.mutate(crdt_name(state.name), :remove, [{:process, child_id}], :infinity)
-    {:noreply, new_state}
+        :ok = DeltaCrdt.mutate(crdt_name(state.name), :remove, [{:process, child_id}], :infinity)
+        {:noreply, new_state}
+
+      _ ->
+        {:noreply, state}
+    end
   end
 
   defp randomize_child_id(child) do
@@ -298,7 +346,14 @@ defmodule Horde.DynamicSupervisorImpl do
   defp set_own_node_status(state, force \\ false)
 
   defp set_own_node_status(state, false) do
-    if Map.get(state.members_info, fully_qualified_name(state.name)) == node_info(state) do
+    info = Map.get(state.members_info, fully_qualified_name(state.name))
+
+    # Only force setting the status if we're in an uninitialized state. We
+    # never want to switch from :dead to :alive, because that can lead to race
+    # conditions. Nodes are only marked dead by other nodes in the cluster
+    # (i.e., if they disconnect for some reason). In that event we can just
+    # restart and resume.
+    if info != nil and info.name == node_info(state).name and info.status != :uninitialized do
       state
     else
       set_own_node_status(state, true)
@@ -319,7 +374,27 @@ defmodule Horde.DynamicSupervisorImpl do
     Map.put(state, :members_info, new_members_info)
   end
 
+  defp check_own_node_status(state) do
+    # Was this node marked dead by another node? if yes, initiate shutdown.
+    # TODO: think about better handling the restart process in this case.
+
+    info = Map.get(state.members_info, fully_qualified_name(state.name))
+
+    case info do
+      %{status: :dead} ->
+        {:reply, :ok, state} = handle_call(:horde_shutting_down, nil, state)
+        state
+
+      _ ->
+        set_own_node_status(state)
+    end
+  end
+
   defp mark_dead(state, name) do
+    Logger.info(fn ->
+      "Marking #{inspect(name)} dead in crdt"
+    end)
+
     DeltaCrdt.mutate(
       crdt_name(state.name),
       :add,
@@ -346,6 +421,8 @@ defmodule Horde.DynamicSupervisorImpl do
   end
 
   def handle_info({:DOWN, ref, _type, _pid, _reason}, state) do
+    Logger.info("Process ref=#{inspect(ref)} DOWN")
+
     case Map.get(state.supervisor_ref_to_name, ref) do
       nil ->
         {:noreply, state}
@@ -353,7 +430,6 @@ defmodule Horde.DynamicSupervisorImpl do
       name ->
         new_state =
           mark_dead(state, name)
-          |> set_own_node_status()
           |> Map.put(:supervisor_ref_to_name, Map.delete(state.supervisor_ref_to_name, ref))
           |> Map.put(:name_to_supervisor_ref, Map.delete(state.name_to_supervisor_ref, name))
 
@@ -367,6 +443,11 @@ defmodule Horde.DynamicSupervisorImpl do
     {:noreply, state}
   end
 
+  def handle_info(:check_processes_for_handoff, state) do
+    state = handoff_processes_if_needed(state)
+    {:noreply, Map.delete(state, :check_processes_for_handoff_timer)}
+  end
+
   def handle_info({:crdt_update, diffs}, state) do
     new_state =
       update_members(state, diffs)
@@ -375,10 +456,10 @@ defmodule Horde.DynamicSupervisorImpl do
     new_state =
       if has_membership_change?(diffs) do
         monitor_supervisors(new_state)
-        |> set_own_node_status()
         |> handle_quorum_change()
+        |> check_own_node_status()
         |> set_crdt_neighbours()
-        |> handoff_processes()
+        |> handoff_processes_if_needed()
       else
         new_state
       end
@@ -400,7 +481,30 @@ defmodule Horde.DynamicSupervisorImpl do
 
   def has_membership_change?([]), do: false
 
-  defp handoff_processes(state) do
+  defp add_child_with_retry(child_spec, state) do
+    {result, state} = add_child(child_spec, state)
+
+    case result do
+      :ignore ->
+        # adding the child failed, probably because the process is still alive somewhere
+        if Map.has_key?(state, :check_processes_for_handoff_timer) do
+          Process.cancel_timer(Map.get(state, :check_processes_for_handoff_timer))
+        end
+
+        timer = Process.send_after(self(), :check_processes_for_handoff, 500)
+
+        Map.put(state, :check_processes_for_handoff_timer, timer)
+
+      _ ->
+        state
+    end
+  end
+
+  defp handoff_processes_if_needed(state) do
+    Logger.debug(fn ->
+      "#{inspect(__MODULE__)} checking processes"
+    end)
+
     this_node = fully_qualified_name(state.name)
 
     Map.values(state.processes_by_id)
@@ -414,8 +518,8 @@ defmodule Horde.DynamicSupervisorImpl do
               # handle_dead_nodes
               case current_member do
                 %{status: :dead} ->
-                  {_, state} = add_child(child_spec, state)
-                  state
+                  Logger.info("Adding child from dead node #{inspect(child_spec)}")
+                  add_child_with_retry(child_spec, state)
 
                 _ ->
                   state
@@ -452,7 +556,9 @@ defmodule Horde.DynamicSupervisorImpl do
 
     case choose_node(child_spec, state) do
       {:ok, %{name: ^this_name}} ->
-        {_resp, new_state} = add_child(child_spec, state)
+        Logger.info("Adding child from another node #{inspect(child_spec)}")
+        new_state = add_child_with_retry(child_spec, state)
+
         new_state
 
       {:ok, _} ->
@@ -557,7 +663,16 @@ defmodule Horde.DynamicSupervisorImpl do
   end
 
   defp set_members(members, state) do
-    members = Enum.map(members, &fully_qualified_name/1)
+    # Include all members from the CRDT which are labeled as being alive.
+    members =
+      Enum.map(members, &fully_qualified_name/1)
+      |> Enum.concat(
+        Enum.filter(members(state), fn {_, member} -> member.status == :active end)
+        |> Enum.map(fn {member, _} -> member end)
+      )
+      |> Enum.uniq()
+
+    Logger.info(fn -> "Setting members: #{inspect(members)}" end)
 
     uninitialized_new_members_info =
       member_names(members)
@@ -588,7 +703,14 @@ defmodule Horde.DynamicSupervisorImpl do
     end)
 
     Enum.each(MapSet.difference(new_member_names, existing_member_names), fn added_member ->
-      DeltaCrdt.mutate(crdt_name(state.name), :add, [{:member, added_member}, 1], :infinity)
+      # Do not add self to CRDT. Doing so can create a race condition. Instead,
+      # we only add _other_ nodes we know about. Other nodes in the cluster
+      # will add this node when they see it as being alive.
+      {this_node_name, _node} = fully_qualified_name(state.name)
+
+      unless added_member == this_node_name do
+        DeltaCrdt.mutate(crdt_name(state.name), :add, [{:member, added_member}, 1], :infinity)
+      end
     end)
 
     %{state | members: new_members, members_info: new_members_info}
@@ -597,41 +719,39 @@ defmodule Horde.DynamicSupervisorImpl do
     |> set_crdt_neighbours()
   end
 
-  defp handle_quorum_change(state) do
-    if state.distribution_strategy.has_quorum?(Map.values(members(state))) do
-      Enum.each(state.waiting_for_quorum, fn from -> GenServer.reply(from, :ok) end)
-      %{state | waiting_for_quorum: []}
-    else
-      shut_down_all_processes(state)
-    end
-  end
+  defp has_quorum(state), do: state.distribution_strategy.has_quorum?(Map.values(members(state)))
 
-  defp shut_down_all_processes(state) do
-    case Enum.any?(state.processes_by_id, processes_for_node(fully_qualified_name(state.name))) do
-      false ->
+  defp handle_quorum_change(state) do
+    cond do
+      has_quorum(state) ->
+        Enum.each(state.waiting_for_quorum, fn from -> GenServer.reply(from, :ok) end)
+
         state
+        |> Map.put(:waiting_for_quorum, [])
 
       true ->
-        :ok = Horde.ProcessesSupervisor.stop(supervisor_name(state.name))
         state
     end
   end
 
   defp set_crdt_neighbours(state) do
-    names = Map.keys(state.members) -- [fully_qualified_name(state.name)]
+    # Don't include nodes marked as dead. Including dead nodes can lead to
+    # strange behaviour, so we exclude them.
+    non_dead_members =
+      if state != nil and Map.has_key?(state, :members_info) do
+        Enum.filter(Map.values(members(state)), fn info -> info.status != :dead end)
+        |> Enum.map(fn member -> member.name end)
+      else
+        []
+      end
+
+    names = (non_dead_members -- [fully_qualified_name(state.name)]) |> Enum.sort()
 
     crdt_names = Enum.map(names, fn {name, node} -> {crdt_name(name), node} end)
 
     send(crdt_name(state.name), {:set_neighbours, crdt_names})
 
     state
-  end
-
-  defp processes_for_node(node_name) do
-    fn
-      {_id, {^node_name, _child_spec, _child_pid}} -> true
-      _ -> false
-    end
   end
 
   defp monitor_supervisors(state) do
@@ -701,6 +821,7 @@ defmodule Horde.DynamicSupervisorImpl do
   end
 
   defp terminate_child(child, state) do
+    Logger.info(fn -> "Terminating child, will remove from crdt: #{inspect(child)}" end)
     child_id = child.id
 
     reply =
@@ -725,17 +846,27 @@ defmodule Horde.DynamicSupervisorImpl do
 
   defp add_children(children, state) do
     Enum.map(children, fn child_spec ->
-      case Horde.ProcessesSupervisor.start_child(supervisor_name(state.name), child_spec) do
-        {:ok, child_pid} ->
-          {{:ok, child_pid}, child_spec}
+      try do
+        case Horde.ProcessesSupervisor.start_child(supervisor_name(state.name), child_spec) do
+          {:ok, child_pid} ->
+            {{:ok, child_pid}, child_spec}
 
-        {:ok, child_pid, term} ->
-          {{:ok, child_pid, term}, child_spec}
+          {:ok, child_pid, term} ->
+            {{:ok, child_pid, term}, child_spec}
 
-        {:error, error} ->
-          {:error, error}
+          {:error, error} ->
+            Logger.error("Error starting child: #{inspect(error)}")
+            {:error, error, child_spec}
 
-        :ignore ->
+          :ignore ->
+            # This can happen often when nodes restart. We should handle it
+            # gracefully and assume the process will get restarted later.
+            Logger.info("Child already started or unable to start, maybe still shutting down?")
+            :ignore
+        end
+      catch
+        :exit, reason ->
+          Logger.error("Error adding child: #{inspect(reason)}, ignoring")
           :ignore
       end
     end)
@@ -755,7 +886,12 @@ defmodule Horde.DynamicSupervisorImpl do
   end
 
   defp choose_node(child_spec, state) do
-    distribution_id = :erlang.phash2(Map.drop(child_spec, [:id]))
+    # Here we assume that the child_spec (including the randomly generated
+    # child ID) can be used for distributing the process across the cluster.
+    # Throughout the lifetime of a given process, the child spec should not
+    # change. If the ID (or any part of the child spec) changes a process could
+    # be lost or duplicated.
+    distribution_id = :erlang.phash2(child_spec)
 
     state.distribution_strategy.choose_node(
       distribution_id,

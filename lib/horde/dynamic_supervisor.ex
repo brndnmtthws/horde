@@ -51,6 +51,7 @@ defmodule Horde.DynamicSupervisor do
   Then you can use `MySupervisor.child_spec/1` and `MySupervisor.start_link/1` in the same way as you'd use `Horde.DynamicSupervisor.child_spec/1` and `Horde.Supervisor.start_link/1`.
   """
   use Supervisor
+  require Logger
 
   @type options() :: [option()]
   @type option ::
@@ -83,7 +84,11 @@ defmodule Horde.DynamicSupervisor do
         default = %{
           id: __MODULE__,
           start: {__MODULE__, :start_link, [arg]},
-          type: :supervisor
+          type: :supervisor,
+          # We use :transient here because we *don't* want the supervisor to
+          # restart during normal shutdowns. When we're shutting down normally,
+          # restarting can lead to race conditions.
+          restart: :transient
         }
 
         Supervisor.child_spec(default, unquote(Macro.escape(options)))
@@ -102,7 +107,8 @@ defmodule Horde.DynamicSupervisor do
     %{
       id: id,
       start: {Horde.DynamicSupervisor, :start_link, [options]},
-      type: :supervisor
+      type: :supervisor,
+      restart: :transient
     }
   end
 
@@ -119,6 +125,7 @@ defmodule Horde.DynamicSupervisor do
       :strategy,
       :distribution_strategy,
       :process_redistribution,
+      :shutdown_after_quorum_lost_delay,
       :members,
       :delta_crdt_options
     ]
@@ -137,12 +144,14 @@ defmodule Horde.DynamicSupervisor do
   Works like `DynamicSupervisor.init/1`.
   """
   def init(options) when is_list(options) do
+    Logger.info(fn -> "Starting #{inspect(__MODULE__)}" end)
+
     unless strategy = options[:strategy] do
       raise ArgumentError, "expected :strategy option to be given"
     end
 
-    intensity = Keyword.get(options, :max_restarts, 3)
-    period = Keyword.get(options, :max_seconds, 5)
+    max_restarts = Keyword.get(options, :max_restarts, 3)
+    max_seconds = Keyword.get(options, :max_seconds, 5)
     max_children = Keyword.get(options, :max_children, :infinity)
     extra_arguments = Keyword.get(options, :extra_arguments, [])
     members = Keyword.get(options, :members, [])
@@ -158,8 +167,8 @@ defmodule Horde.DynamicSupervisor do
 
     flags = %{
       strategy: strategy,
-      intensity: intensity,
-      period: period,
+      max_restarts: max_restarts,
+      max_seconds: max_seconds,
       max_children: max_children,
       extra_arguments: extra_arguments,
       distribution_strategy: distribution_strategy,
@@ -190,8 +199,6 @@ defmodule Horde.DynamicSupervisor do
              root_name: name,
              init_module: mod,
              strategy: flags.strategy,
-             intensity: flags.intensity,
-             period: flags.period,
              max_children: flags.max_children,
              extra_arguments: flags.extra_arguments,
              strategy: flags.strategy,
@@ -205,7 +212,9 @@ defmodule Horde.DynamicSupervisor do
              root_name: name,
              type: :supervisor,
              name: supervisor_name(name),
-             strategy: flags.strategy
+             strategy: flags.strategy,
+             max_restarts: flags.max_restarts,
+             max_seconds: flags.max_seconds
            ]},
           {Horde.SignalShutdown,
            [
